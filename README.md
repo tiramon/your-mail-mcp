@@ -322,7 +322,11 @@ exists. On that specific failure, the server asks mbsync for the channel's
 selected folders and, only if names repeat, retries once with an exact,
 deduplicated list. Distinct names stay distinct; account patterns and
 pull-only settings are unchanged. A listing failure or failed retry remains
-an error. Commas in mailbox names and
+an error. Recovery also verifies that every selected mailbox reached
+synchronization: an explicit mbsync mailbox list can otherwise turn a failed
+SELECT into a warning or deletion with exit code zero. Previously deleted
+remote folders whose non-empty local copies were already acknowledged by
+the normal channel retain that behavior. Commas in mailbox names and
 oversized lists cannot be safely passed through mbsync's command-line
 override, so recovery refuses those rather than syncing an incomplete list.
 

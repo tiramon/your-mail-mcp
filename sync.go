@@ -577,10 +577,54 @@ func (s *Syncer) syncFull(ctx context.Context, name string) (string, error) {
 	if parseErr != nil {
 		return out, fmt.Errorf("%w; cannot safely retry duplicate mailboxes: %v", err, parseErr)
 	}
-	// One explicit list in one invocation keeps channel-wide semantics and the
-	// account lock/deadline. Never retry recursively or mask a second failure.
+	// Explicit entries are BOX_POSSIBLE rather than BOX_PRESENT in isync 1.5.
+	// A failed SELECT can therefore become a skipped/deleted mailbox and exit
+	// zero. Verbose output lets us require that each selected mailbox actually
+	// reached synchronization, except a deletion already acknowledged by the
+	// normal channel. Keep the same account lock/deadline and retry only once.
 	fmt.Fprintf(os.Stderr, "sync: account %s: retrying full channel with %d unique mailboxes after duplicate listing\n", name, len(boxes))
-	return s.runCmd(ctx, "mbsync", "-c", s.mbsyncConfig, channel+":"+strings.Join(boxes, ","))
+	retryOut, retryErr := s.runCmd(ctx, "mbsync", "-V", "-c", s.mbsyncConfig, channel+":"+strings.Join(boxes, ","))
+	if retryErr != nil {
+		return retryOut, retryErr
+	}
+	if checkErr := validateMailboxRetry(channel, boxes, out, retryOut); checkErr != nil {
+		return retryOut, fmt.Errorf("%w; %v", err, checkErr)
+	}
+	return retryOut, nil
+}
+
+// validateMailboxRetry fails closed even when mbsync exits zero after skipping
+// a mailbox or removing its empty local copy. A verbose successful mailbox
+// reaches "Synchronizing..." after both stores have opened and loaded it.
+// The normal channel may legitimately skip a previously deleted remote mailbox
+// whose non-empty local copy must survive; allow only that same warning again.
+func validateMailboxRetry(channel string, boxes []string, initialOut, retryOut string) error {
+	completed := map[string]bool{}
+	retryLines := map[string]bool{}
+	current := ""
+	for _, line := range strings.Split(retryOut, "\n") {
+		retryLines[line] = true
+		if strings.HasPrefix(line, "Opening far side box ") && strings.HasSuffix(line, "...") {
+			current = strings.TrimSuffix(strings.TrimPrefix(line, "Opening far side box "), "...")
+		} else if line == "Synchronizing..." {
+			completed[current] = true
+		}
+	}
+	initialLines := map[string]bool{}
+	for _, line := range strings.Split(initialOut, "\n") {
+		initialLines[line] = true
+	}
+	for _, box := range boxes {
+		if completed[box] {
+			continue
+		}
+		warning := fmt.Sprintf("Warning: channel %s: far side box %s cannot be opened anymore, and near side box %s is not empty.", channel, box, box)
+		if initialLines[warning] && retryLines[warning] {
+			continue
+		}
+		return fmt.Errorf("duplicate-list retry did not synchronize mailbox %q", box)
+	}
+	return nil
 }
 
 // uniqueChannelMailboxes preserves exact names and first-occurrence order.

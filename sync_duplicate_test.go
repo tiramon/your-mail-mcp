@@ -50,7 +50,10 @@ func TestSyncFullRecoversDuplicateMailboxListing(t *testing.T) {
 		if args[len(args)-1] == "home-full" {
 			return duplicateMailboxError, errors.New("mbsync: exit status 1: " + duplicateMailboxError)
 		}
-		return "full channel recovered", nil
+		if strings.HasPrefix(args[len(args)-1], "home-full:") {
+			return successfulMailboxTrace(strings.Split(strings.TrimPrefix(args[len(args)-1], "home-full:"), ",")), nil
+		}
+		return "", nil
 	}
 	listCalls := 0
 	s.listCmd = func(_ context.Context, command string, args ...string) (string, error) {
@@ -67,11 +70,42 @@ func TestSyncFullRecoversDuplicateMailboxListing(t *testing.T) {
 		t.Fatalf("want recent, full, list, one retry; got calls=%q, list calls=%d", calls, listCalls)
 	}
 	want := "home-full:INBOX,Archive,Archives,Shared/owner@example.org/INBOX,Shared/owner@example.org/INBOX/Child, Sent Items ,Entwürfe"
-	if !reflect.DeepEqual(calls[2], []string{"-c", s.mbsyncConfig, want}) {
+	if !reflect.DeepEqual(calls[2], []string{"-V", "-c", s.mbsyncConfig, want}) {
 		t.Fatalf("retry = %q, want configured full channel with exact unique names", calls[2])
 	}
 	if st := s.Status()["home"]; !st.Complete || st.LastError != "" || st.Failures != 0 {
 		t.Fatalf("recovered pass must count as success: %+v", st)
+	}
+}
+
+func successfulMailboxTrace(boxes []string) string {
+	var out strings.Builder
+	for _, box := range boxes {
+		out.WriteString("Opening far side box " + box + "...\nSynchronizing...\n")
+	}
+	return out.String()
+}
+
+func TestValidateMailboxRetry(t *testing.T) {
+	boxes := []string{"INBOX", "Other"}
+	warning := "Warning: channel home-full: far side box Other cannot be opened anymore, and near side box Other is not empty.\n"
+	for _, tc := range []struct {
+		name, initial, retry string
+		wantError            bool
+	}{
+		{"all synchronized", "", successfulMailboxTrace(boxes), false},
+		{"SELECT denied", "", successfulMailboxTrace(boxes[:1]) + "Opening far side box Other...\n" + warning, true},
+		{"empty local mailbox removed", "", successfulMailboxTrace(boxes[:1]) + "Opening far side box Other...\nDeleting near side box Other...\n", true},
+		{"known remote deletion", warning, successfulMailboxTrace(boxes[:1]) + warning, false},
+		{"known warning but unreported skip", warning, successfulMailboxTrace(boxes[:1]), true},
+		{"unrecognized output", "", "Channels: 1 Boxes: 2\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMailboxRetry("home-full", boxes, tc.initial, tc.retry)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("validation = %v, want error=%v", err, tc.wantError)
+			}
+		})
 	}
 }
 
