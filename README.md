@@ -316,6 +316,16 @@ folders are named and in whatever language. While an account's mirror is
 still filling, these four tools prepend a note naming the account and how
 many messages are indexed so far.
 
+Some IMAP servers list the same mailbox twice, which can make mbsync report
+`near side box ... cannot be opened anymore` even though the local folder
+exists. On that specific failure, the server asks mbsync for the channel's
+selected folders and, only if names repeat, retries once with an exact,
+deduplicated list. Distinct names stay distinct; account patterns and
+pull-only settings are unchanged. A listing failure or failed retry remains
+an error. Commas in mailbox names and
+oversized lists cannot be safely passed through mbsync's command-line
+override, so recovery refuses those rather than syncing an incomplete list.
+
 Attachments are listed in `show` and `thread` and served by the `attachment`
 tool one part at a time: images inline up to 5MB, textual parts as marked
 text, and other binaries as a short-lived signed link to

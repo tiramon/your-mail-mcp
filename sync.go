@@ -249,7 +249,10 @@ type Syncer struct {
 	// the normal cadence, capped at an hour, instead of hammered every tick.
 	interval time.Duration
 
-	runCmd  func(ctx context.Context, name string, args ...string) (string, error)
+	runCmd func(ctx context.Context, name string, args ...string) (string, error)
+	// listCmd keeps stdout separate from diagnostics: mbsync's deprecation
+	// notices must never be interpreted as mailbox names.
+	listCmd func(ctx context.Context, name string, args ...string) (string, error)
 	reindex func(ctx context.Context) (int, error)
 	// mountPoint defaults to the package-level isMountPoint; overridden in
 	// tests, since a real mount point is not reproducible in one.
@@ -298,6 +301,26 @@ func execCommand(ctx context.Context, name string, args ...string) (string, erro
 	return out, nil
 }
 
+// execListCommand returns only stdout on success, but includes redacted stderr
+// on failure, like execCommand. Successful diagnostics still reach the log.
+func execListCommand(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	raw, err := cmd.Output()
+	diagnostics := authData.ReplaceAllString(stderr.String(), "$1 <authdata>")
+	if err != nil {
+		out := authData.ReplaceAllString(string(raw), "$1 <authdata>")
+		return out, fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(out+diagnostics))
+	}
+	if diagnostics != "" {
+		fmt.Fprint(os.Stderr, diagnostics)
+	}
+	// Successful stdout contains mailbox names, not diagnostics. A mailbox
+	// whose name resembles an AUTHENTICATE command must remain unchanged.
+	return string(raw), nil
+}
+
 func newSyncer(cfg *Config, maildir, index, mbsyncConfig string, nm *Notmuch) *Syncer {
 	// Completion survives restarts through the marker files; see
 	// completeMarker. A wiped index directory simply reruns bootstrap.
@@ -319,6 +342,7 @@ func newSyncer(cfg *Config, maildir, index, mbsyncConfig string, nm *Notmuch) *S
 		mountPoint:   isMountPoint,
 		status:       status,
 		runCmd:       execCommand,
+		listCmd:      execListCommand,
 		reindex: func(ctx context.Context) (int, error) {
 			// A missing database is the normal state on a first run: notmuch
 			// new is what creates it. The count is only here to report how
@@ -504,7 +528,7 @@ func (s *Syncer) syncAccount(ctx context.Context, name string) (string, error) {
 			fmt.Fprintf(os.Stderr, "sync: account %s: recent: ok\n", name)
 		}
 	}
-	out, err := s.runCmd(accountCtx, "mbsync", "-c", s.mbsyncConfig, name+"-full")
+	out, err := s.syncFull(accountCtx, name)
 	if err == nil {
 		// The recent store is bootstrap scaffolding: after full's first
 		// clean exit its files are duplicates notmuch had merged by
@@ -526,6 +550,68 @@ func (s *Syncer) syncAccount(ctx context.Context, name string) (string, error) {
 		return out, fmt.Errorf("sync deadline %s reached: %w", s.timeout, context.DeadlineExceeded)
 	}
 	return out, err
+}
+
+// missingNearBox is emitted by isync 1.5 when its sorted server/local merge
+// pairs the second occurrence of a remote mailbox with no local occurrence.
+// This also happens for genuinely missing local mailboxes, so the diagnostic
+// alone is not permission to retry: the channel listing must contain duplicates.
+var missingNearBox = regexp.MustCompile(`(?m)^Error: channel [^\n]+: near side box [^\n]+ cannot be opened anymore\.$`)
+
+func (s *Syncer) syncFull(ctx context.Context, name string) (string, error) {
+	channel := name + "-full"
+	out, err := s.runCmd(ctx, "mbsync", "-c", s.mbsyncConfig, channel)
+	if err == nil || ctx.Err() != nil || !missingNearBox.MatchString(out+"\n"+err.Error()) {
+		return out, err
+	}
+	// Ask mbsync, not a separate IMAP client: this preserves its authentication,
+	// delimiter conversion, configured Patterns and locally-only mailboxes.
+	listing, listErr := s.listCmd(ctx, "mbsync", "-l", "-c", s.mbsyncConfig, channel)
+	if listErr != nil {
+		return out, fmt.Errorf("%w; listing channel for duplicate mailboxes: %v", err, listErr)
+	}
+	boxes, duplicates, parseErr := uniqueChannelMailboxes(listing)
+	if !duplicates {
+		return out, err
+	}
+	if parseErr != nil {
+		return out, fmt.Errorf("%w; cannot safely retry duplicate mailboxes: %v", err, parseErr)
+	}
+	// One explicit list in one invocation keeps channel-wide semantics and the
+	// account lock/deadline. Never retry recursively or mask a second failure.
+	fmt.Fprintf(os.Stderr, "sync: account %s: retrying full channel with %d unique mailboxes after duplicate listing\n", name, len(boxes))
+	return s.runCmd(ctx, "mbsync", "-c", s.mbsyncConfig, channel+":"+strings.Join(boxes, ","))
+}
+
+// uniqueChannelMailboxes preserves exact names and first-occurrence order.
+// Distinct and case-sensitive names are not aliases.
+// mbsync's command-line override splits on commas (and, in 1.5, newlines),
+// with no escape syntax. Refuse an ambiguous list rather than sync a subset.
+func uniqueChannelMailboxes(listing string) (boxes []string, duplicates bool, err error) {
+	seen := map[string]bool{}
+	for _, box := range strings.Split(strings.TrimSuffix(listing, "\n"), "\n") {
+		if box == "" {
+			if listing != "" {
+				err = errors.New("empty mailbox name in channel listing")
+			}
+			continue
+		}
+		if strings.ContainsAny(box, ",\r\x00") {
+			err = errors.New("mailbox name cannot be represented in an mbsync command-line override")
+		}
+		if seen[box] {
+			duplicates = true
+			continue
+		}
+		seen[box] = true
+		boxes = append(boxes, box)
+	}
+	// A single exec argument is limited on Linux; stay below 128 KiB even with
+	// the account/channel prefix and leave oversized listings to normal mbsync.
+	if len(strings.Join(boxes, ",")) > 64*1024 {
+		err = errors.New("channel listing is too large for a safe command-line override")
+	}
+	return boxes, duplicates, err
 }
 
 // markMirrored records, in the index directory, that a mirror exists at
